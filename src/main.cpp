@@ -39,6 +39,7 @@
 #include <cstdlib>
 #include <atomic>
 #include <mutex>
+#include <set>
 #include <filesystem>
 
 #include "json.hpp"
@@ -127,13 +128,14 @@ std::unordered_set<int> g_notifyTypes = {
 std::unordered_map<std::string, std::string> g_memberNames;  // wxid -> 昵称（群成员用）
 
 // ==================== 图片预览 ====================
-// 图片本体在 msg\attach\<md5(会话)>\<yyyy-MM>\Img\*.dat，是加密的：
-//   <6 字节魔数 07 08 56 32 08 07><9 字节头><AES-128-ECB 密文>
-// 解密后 *_t.dat 是 JPEG 缩略图，主 *.dat 是 wxgf(内部 HEVC)。
-// 这里按优先级找一张能显示给 Toast 的图：
-//   1. cache\<月>\Message\<md5>\Thumb\*_thumb.jpg —— 微信自己解出来的明文，但只有它在
-//      UI 里渲染过这张图时才存在，不能指望
-//   2. 自己用 image_aeskey 解 *_t.dat（key 每个用户/每条消息都可能不同，只能外部提供）
+// 微信 4.x 的图片本体在 msg\attach\<md5(会话)>\<yyyy-MM>\Img\*.dat，是加密的，
+// 而且每台机器、每个账号的密钥都不一样，所以程序根本不碰密钥，只读微信自己解好的：
+//   1. cache\<月>\Message\<md5>\Thumb\*_thumb.jpg —— 明文缩略图，
+//      但只有微信在界面里渲染过这张图才会生成，不能指望
+//   2. cache\<月>\Message\<md5>\ImageTemp\<序号>_<Unix秒>_mid_temp_convert ——
+//      微信解好的 wxgf(HEVC) 预览。文件名里的秒 == 消息 timestamp，
+//      文件大小 == 推送正文里的 hevc_mid_size，两个特征就能唯一定位到这条消息自己的图。
+//      这是主力路径：剥掉 wxgf 头，交给 ffmpeg 取一帧存成 JPEG
 //   3. hook 的 /Decode_Pic（不同 hook 版本行为不同，兜底）
 std::atomic<bool> g_imgPreview{true};
 std::atomic<bool> g_dbgPayload{false};    // 把原始推送写进 payload.log，排查用
@@ -141,6 +143,21 @@ std::wstring g_imgDir;                    // 自己管的图片缓存（Toast �
 std::vector<std::wstring> g_wxRoots;      // ...\xwechat_files\<wxid>
 std::string  g_imgAesKey;                 // 图片 dat 的 AES-128 key（16 字符），来自 config
 std::mutex g_imgMtx;
+
+// 已经附给某条通知的预览文件。微信的 ImageTemp 里一份文件对应一张图，
+// 用过的不能再给下一条消息用 —— 否则重试/并发时会拿上一条的图顶上。
+std::mutex g_usedMtx;
+std::set<std::wstring> g_usedConv;
+
+static bool conv_used(const std::wstring& p) {
+    std::lock_guard<std::mutex> lk(g_usedMtx);
+    return g_usedConv.count(p) > 0;
+}
+static void conv_mark_used(const std::wstring& p) {
+    std::lock_guard<std::mutex> lk(g_usedMtx);
+    if (g_usedConv.size() > 512) g_usedConv.clear();
+    g_usedConv.insert(p);
+}
 
 // ==================== 监听范围 ====================
 // ALL      = 所有人（群聊 + 私聊 + 公众号全收）
@@ -573,6 +590,9 @@ static std::wstring find_thumb_in(const std::wstring& dir, long long ts, long lo
         if (u == std::wstring::npos) continue;
         long long fts = 0;
         try { fts = std::stoll(name.substr(u + 1, p - u - 1)); } catch (...) { continue; }
+        // 微信是先收到消息、过一会儿才落盘缩略图。
+        // 比消息时刻还早 3 秒以上的，只能是上一条消息留下的，直接排除。
+        if (fts + 3 < ts) continue;
         long long d = (fts > ts) ? (fts - ts) : (ts - fts);
         if (d <= tolSec && d < bestDiff) { bestDiff = d; best = e.path().wstring(); }
     }
@@ -748,10 +768,30 @@ static std::wstring hevc_blob_to_jpg(const std::string& blob, uint64_t msgid) {
     return dst;
 }
 
-// 定位微信自己生成的那份预览（文件名里带图片消息的 Unix 秒）
-static std::wstring find_mid_convert(const json& d, long long ts, long long tolSec) {
+// 推送正文里的 <img hevc_mid_size="N">：微信为这条消息生成的那份预览的确切字节数。
+// 实测 N 与 ImageTemp 下 _mid_temp_convert 的文件大小完全相同，文件名里的 Unix 秒
+// 又正好等于消息 timestamp —— 两个特征叠起来就能唯一定位到这条消息自己的图。
+static long long img_hevc_mid_size(const json& d) {
+    auto c = d.value("content", std::string());
+    auto p = c.find("hevc_mid_size=\"");
+    if (p == std::string::npos) return 0;
+    p += sizeof("hevc_mid_size=\"") - 1;
+    auto e = c.find('"', p);
+    if (e == std::string::npos) return 0;
+    try { return std::stoll(c.substr(p, e - p)); } catch (...) { return 0; }
+}
+
+// 在 ImageTemp 里定位这条消息自己那份预览。三级判定，越往下越宽松，
+// 但任何一级都不接受"比消息更早生成"的文件 —— 那只能是上一条消息的图：
+//   ① 文件名秒 ≈ 消息秒 且 大小 == hevc_mid_size   → 独一份，最可信
+//   ② 文件名秒 ≈ 消息秒                            → 同一秒只有一条图片消息时成立
+//   ③ 大小 == hevc_mid_size 且 相差 120 秒内        → 时间戳不准时靠大小认
+static std::wstring find_mid_convert(const json& d, long long ts, long long wantSize) {
     auto peers = peer_candidates(d);
     std::wstring months[3] = { month_of(ts), month_of(ts, -1), month_of(ts, 1) };
+
+    std::wstring bestA, bestB, bestC;
+    long long diffA = LLONG_MAX, diffB = LLONG_MAX, diffC = LLONG_MAX;
 
     for (auto& root : g_wxRoots) {
         for (auto& m : months) {
@@ -763,8 +803,6 @@ static std::wstring find_mid_convert(const json& d, long long ts, long long tolS
                 std::error_code ec;
                 if (!fs::is_directory(dir, ec)) continue;
 
-                std::wstring best;
-                long long bestDiff = LLONG_MAX;
                 for (auto& e : fs::directory_iterator(dir, ec)) {
                     if (ec) break;
                     if (!e.is_regular_file(ec)) continue;
@@ -775,19 +813,36 @@ static std::wstring find_mid_convert(const json& d, long long ts, long long tolS
                     if (us == std::wstring::npos) continue;
                     long long fts = 0;
                     try { fts = std::stoll(name.substr(us + 1, up - us - 1)); } catch (...) { continue; }
-                    long long dd = (fts > ts) ? (fts - ts) : (ts - fts);
-                    if (dd <= tolSec && dd < bestDiff) { bestDiff = dd; best = e.path().wstring(); }
+
+                    if (fts + 3 < ts) continue;            // 早于消息 = 上一条的图
+                    long long dd = fts - ts;
+                    if (dd < 0) dd = -dd;
+                    if (dd > 120) continue;
+
+                    std::error_code sec;
+                    auto sz = (long long)fs::file_size(e.path(), sec);
+                    if (sec) continue;
+
+                    std::wstring path = e.path().wstring();
+                    if (conv_used(path)) continue;          // 已经附给别的消息了
+
+                    bool sizeOk = (wantSize > 0 && sz == wantSize);
+                    if (sizeOk && dd <= 2 && dd < diffA) { diffA = dd; bestA = path; }
+                    if (dd <= 2 && dd < diffB)           { diffB = dd; bestB = path; }
+                    if (sizeOk && dd < diffC)            { diffC = dd; bestC = path; }
                 }
-                if (!best.empty()) return best;
             }
         }
     }
-    return L"";
+    if (!bestA.empty()) return bestA;
+    if (!bestB.empty()) return bestB;
+    return bestC;
 }
 
-// 兜底：推送里的 timestamp 和文件名里的对不上时，退而求其次——
-// 在这个会话的 ImageTemp 里找刚刚生成的那一份（限定 maxAgeSec 内最新）。
-static std::wstring find_mid_convert_recent(const json& d, long long maxAgeSec) {
+// 最后兜底：推送里没有 hevc_mid_size、文件名秒数也和 timestamp 对不上时，
+// 只认"这条消息之后 30 秒内新冒出来、且没被别的消息用过"的那一份。
+// 绝不再用整个会话最近的一份凑数 —— 那正是偶尔套上一条图的根源。
+static std::wstring find_mid_convert_recent(const json& d, long long sinceSec) {
     auto peers = peer_candidates(d);
     long long now = (long long)time(nullptr);
     std::wstring best;
@@ -813,7 +868,10 @@ static std::wstring find_mid_convert_recent(const json& d, long long maxAgeSec) 
                     long long fts = (long long)std::chrono::system_clock::to_time_t(sys);
                     long long age = now - fts;
                     if (age < 0) age = 0;
-                    if (age <= maxAgeSec && fts > bestT) { bestT = fts; best = e.path().wstring(); }
+                    if (age > 30) continue;              // 只认刚生成的
+                    if (fts + 3 < sinceSec) continue;    // 不能早于这条消息
+                    if (conv_used(e.path().wstring())) continue;
+                    if (fts > bestT) { bestT = fts; best = e.path().wstring(); }
                 }
             }
         }
@@ -905,19 +963,24 @@ std::wstring resolve_image(const json& d, uint64_t msgid) {
     if (ts <= 0) ts = (long long)time(nullptr);
     if (ts > 100000000000LL) ts /= 1000;   // 防御：万一给了毫秒
 
-    // 先严后松：±3 秒精确命中，再放宽到 ±12 秒，最后整月兜底
+    // 明文缩略图（微信在 UI 里渲染过才有）
     std::wstring f = find_plain_thumb(d, ts, 3);
     if (f.empty()) f = find_plain_thumb(d, ts, 12);
     if (!f.empty()) return store_for_toast(f, msgid);
 
-    // 微信自己解好的预览（wxgf/HEVC）：文件名里就是这条消息的时间戳，先说 ±8 秒
-    std::wstring conv = find_mid_convert(d, ts, 8);
-    if (conv.empty()) conv = find_mid_convert(d, ts, 120);
-    if (conv.empty()) conv = find_mid_convert(d, ts, 600);
-    if (conv.empty()) conv = find_mid_convert_recent(d, 240);   // 文件名时间戳对不上时
+    // 微信自己解好的预览（wxgf/HEVC）。用 hevc_mid_size + 文件名秒双重定位，
+    // 两个特征都取自这条消息本身，不再靠"谁和时间戳更接近"去猜。
+    long long wantSize = img_hevc_mid_size(d);
+    std::wstring conv = find_mid_convert(d, ts, wantSize);
     if (!conv.empty()) {
         std::wstring jpg = hevc_blob_to_jpg(read_file_bin(conv), msgid);
-        if (!jpg.empty()) return jpg;
+        if (!jpg.empty()) { conv_mark_used(conv); return jpg; }
+    }
+    // 时间戳和大小都对不上时，只接受"这条消息之后新生成的那份"
+    conv = find_mid_convert_recent(d, ts);
+    if (!conv.empty()) {
+        std::wstring jpg = hevc_blob_to_jpg(read_file_bin(conv), msgid);
+        if (!jpg.empty()) { conv_mark_used(conv); return jpg; }
     }
 
     return decode_dat_via_hook(d, ts, msgid);
@@ -1534,13 +1597,15 @@ int main(int argc, char** argv) {
     GetModuleFileNameW(NULL, b, MAX_PATH);
     g_exeDir = wtou8(std::wstring(b).substr(0, std::wstring(b).find_last_of(L"\\/") + 1));
 
-    // 通知里的图片必须活到 Toast 真正读它为止，统一放自己管的目录
+    // 通知里的图片必须活到 Toast 真正读它为止，统一放临时目录 %temp%\WxNotifier
+    // （随系统临时目录走，用户能自己清；程序也会删掉 2 小时前的旧图）
     {
-        wchar_t la[MAX_PATH];
-        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, la)))
-            g_imgDir = std::wstring(la) + L"\\WxNotifier\\images";
+        wchar_t lt[MAX_PATH] = {};
+        DWORD n = GetTempPathW(MAX_PATH, lt);
+        if (n > 0 && n < MAX_PATH)
+            g_imgDir = std::wstring(lt) + L"WxNotifier";   // GetTempPathW 自带尾部反斜杠
         else
-            g_imgDir = u8tow(g_exeDir) + L"images";
+            g_imgDir = u8tow(g_exeDir) + L"WxNotifier";
     }
 
     try {
