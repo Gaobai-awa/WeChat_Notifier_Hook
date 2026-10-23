@@ -16,7 +16,6 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <wincrypt.h>
-#include <bcrypt.h>
 #include <tlhelp32.h>
 #include <shobjidl.h>
 #include <shellapi.h>
@@ -141,7 +140,6 @@ std::atomic<bool> g_imgPreview{true};
 std::atomic<bool> g_dbgPayload{false};    // 把原始推送写进 payload.log，排查用
 std::wstring g_imgDir;                    // 自己管的图片缓存（Toast 引用期间必须存在）
 std::vector<std::wstring> g_wxRoots;      // ...\xwechat_files\<wxid>
-std::string  g_imgAesKey;                 // 图片 dat 的 AES-128 key（16 字符），来自 config
 std::mutex g_imgMtx;
 
 // 已经附给某条通知的预览文件。微信的 ImageTemp 里一份文件对应一张图，
@@ -247,10 +245,6 @@ std::string gen_config_template() {
         "  \"notify_types\": [1, 3, 34, 37, 42, 43, 47, 48, 49, 50, 62, 10000, 10002],\n\n"
         "  // 图片消息：在通知里直接显示图片\n"
         "  \"image_preview\": true,\n\n"
-        "  // 图片 dat 的解密密钥：账号级，每台机器都不一样，填一次永久有效。\n"
-        "  // 可填 16 个字符，或 32 位十六进制。留空时只能读微信已经渲染过的缩略图，\n"
-        "  // 很多图片会取不到（微信的临时预览生成完就删）。\n"
-        "  \"image_key\": \"\",\n\n"
         "  // 微信的图片预览是 wxgf(HEVC) 格式，需要 ffmpeg 取一帧转成 JPEG。\n"
         "  // 留空则依次找：程序目录\\ffmpeg.exe、程序目录\\bin\\ffmpeg.exe、PATH\n"
         "  \"ffmpeg_path\": \"\",\n\n"
@@ -595,8 +589,9 @@ static std::wstring find_thumb_in(const std::wstring& dir, long long ts, long lo
         long long fts = 0;
         try { fts = std::stoll(name.substr(u + 1, p - u - 1)); } catch (...) { continue; }
         // 微信是先收到消息、过一会儿才落盘缩略图。
-        // 比消息时刻还早 3 秒以上的，只能是上一条消息留下的，直接排除。
-        if (fts + 3 < ts) continue;
+        // 明显早于这条消息的只能是上一条留下的，排除（留 30 秒余量，
+        // 防止文件名用的是图片发送时间而不是接收时间）。
+        if (fts + 30 < ts) continue;
         long long d = (fts > ts) ? (fts - ts) : (ts - fts);
         if (d <= tolSec && d < bestDiff) { bestDiff = d; best = e.path().wstring(); }
     }
@@ -785,11 +780,10 @@ static long long img_hevc_mid_size(const json& d) {
     try { return std::stoll(c.substr(p, e - p)); } catch (...) { return 0; }
 }
 
-// 在 ImageTemp 里定位这条消息自己那份预览。三级判定，越往下越宽松，
-// 但任何一级都不接受"比消息更早生成"的文件 —— 那只能是上一条消息的图：
-//   ① 文件名秒 ≈ 消息秒 且 大小 == hevc_mid_size   → 独一份，最可信
-//   ② 文件名秒 ≈ 消息秒                            → 同一秒只有一条图片消息时成立
-//   ③ 大小 == hevc_mid_size 且 相差 120 秒内        → 时间戳不准时靠大小认
+// 在 ImageTemp 里定位这条消息自己那份预览。三级判定，越往下越宽松：
+//   ① 大小 == hevc_mid_size            → 每张图大小不同，这一条几乎不会认错
+//   ② 文件名秒 == 消息秒                → 同一秒只有一条图片消息时成立
+//   ③ 时间最接近的一份                  → 兜底，可能套上邻近的图，但保证有图
 static std::wstring find_mid_convert(const json& d, long long ts, long long wantSize) {
     auto peers = peer_candidates(d);
     std::wstring months[3] = { month_of(ts), month_of(ts, -1), month_of(ts, 1) };
@@ -818,10 +812,12 @@ static std::wstring find_mid_convert(const json& d, long long ts, long long want
                     long long fts = 0;
                     try { fts = std::stoll(name.substr(us + 1, up - us - 1)); } catch (...) { continue; }
 
-                    if (fts + 3 < ts) continue;            // 早于消息 = 上一条的图
+                    // 只排除"明显早于这条消息"的旧文件（30 秒容忍，防止文件名用的是
+                    // 图片发送时间而非接收时间），再远就只能算别的消息了
+                    if (fts + 30 < ts) continue;
                     long long dd = fts - ts;
                     if (dd < 0) dd = -dd;
-                    if (dd > 120) continue;
+                    if (dd > 1800) continue;             // 半小时外的不考虑
 
                     std::error_code sec;
                     auto sz = (long long)fs::file_size(e.path(), sec);
@@ -830,10 +826,12 @@ static std::wstring find_mid_convert(const json& d, long long ts, long long want
                     std::wstring path = e.path().wstring();
                     if (conv_used(path)) continue;          // 已经附给别的消息了
 
-                    bool sizeOk = (wantSize > 0 && sz == wantSize);
-                    if (sizeOk && dd <= 2 && dd < diffA) { diffA = dd; bestA = path; }
-                    if (dd <= 2 && dd < diffB)           { diffB = dd; bestB = path; }
-                    if (sizeOk && dd < diffC)            { diffC = dd; bestC = path; }
+                    // ① 大小对上：算最强证据，时间只当作同分时的先后
+                    if (wantSize > 0 && sz == wantSize && dd < diffA) { diffA = dd; bestA = path; }
+                    // ② 秒对上
+                    if (dd <= 3 && dd < diffB)                        { diffB = dd; bestB = path; }
+                    // ③ 兜底：时间最近的一份
+                    if (dd < diffC)                                   { diffC = dd; bestC = path; }
                 }
             }
         }
@@ -872,8 +870,8 @@ static std::wstring find_mid_convert_recent(const json& d, long long sinceSec) {
                     long long fts = (long long)std::chrono::system_clock::to_time_t(sys);
                     long long age = now - fts;
                     if (age < 0) age = 0;
-                    if (age > 30) continue;              // 只认刚生成的
-                    if (fts + 3 < sinceSec) continue;    // 不能早于这条消息
+                    if (age > 120) continue;             // 只认刚生成的（给落盘留足时间）
+                    if (fts + 30 < sinceSec) continue;   // 不能明显早于这条消息
                     if (conv_used(e.path().wstring())) continue;
                     if (fts > bestT) { bestT = fts; best = e.path().wstring(); }
                 }
@@ -888,89 +886,6 @@ static std::string read_file_bin(const std::wstring& p) {    std::ifstream f(p, 
     return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 }
 
-// ---------- 微信 4.x 图片 dat 解密 ----------
-// 主图 dat 的结构：<6 字节魔数 07 08 56 32 08 07><9 字节头><AES-128-ECB 密文>
-// 密钥是账号级的 16 字节，每台机器/每个账号都不同，所以只能由用户在 config 的
-// image_key 里填一次（不写死在程序里）。密文按 16 字节整块独立解密，尾部余数丢弃。
-// 解密出来是 wxgf 容器，里面包着裸 HEVC，交给 ffmpeg 取一帧就是完整原图。
-static std::string aes128_ecb_decrypt(const std::string& key16, const std::string& ct) {
-    if (key16.size() != 16 || ct.size() < 16 || ct.size() % 16) return std::string();
-    std::string out(ct.size(), '\0');
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    BCRYPT_KEY_HANDLE kh = nullptr;
-    ULONG got = 0;
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0) < 0) return std::string();
-    BCryptSetProperty(alg, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_ECB,
-                      sizeof(BCRYPT_CHAIN_MODE_ECB), 0);
-    if (BCryptGenerateSymmetricKey(alg, &kh, nullptr, 0, (PUCHAR)key16.data(), 16, 0) >= 0) {
-        if (BCryptDecrypt(kh, (PUCHAR)ct.data(), (ULONG)ct.size(), nullptr, nullptr, 0,
-                          (PUCHAR)out.data(), (ULONG)out.size(), &got, 0) < 0)
-            out.clear();
-        else
-            out.resize(got);
-    }
-    if (kh) BCryptDestroyKey(kh);
-    BCryptCloseAlgorithmProvider(alg, 0);
-    return out;
-}
-
-// 在 attach\...\Img 里找这条消息自己的主图 dat（排除 _t / _h 缩略图）。
-// 首选判据：文件大小 == 推送里的 hevc_mid_size + 31（容器头开销固定 31 字节，
-// 每张图大小都不一样，比按时间猜可靠得多）；没有 size 时才退回按修改时间匹配。
-static std::wstring find_img_dat(const json& d, long long ts, long long wantSize) {
-    auto peers = peer_candidates(d);
-    std::wstring months[3] = { month_of(ts), month_of(ts, -1), month_of(ts, 1) };
-    std::wstring bestTime;
-    long long bestDiff = LLONG_MAX;
-
-    for (auto& root : g_wxRoots) {
-        for (auto& m : months) {
-            for (auto& p : peers) {
-                std::string md5 = md5_hex(p);
-                if (md5.empty()) continue;
-                std::wstring dir = root + L"\\msg\\attach\\" + u8tow(md5) + L"\\" + m + L"\\Img";
-                std::error_code ec;
-                if (!fs::is_directory(dir, ec)) continue;
-                for (auto& e : fs::directory_iterator(dir, ec)) {
-                    if (ec) break;
-                    if (!e.is_regular_file(ec)) continue;
-                    auto name = e.path().filename().wstring();
-                    if (name.size() < 4 || name.compare(name.size() - 4, 4, L".dat") != 0) continue;
-                    if (name.size() >= 6 && name.compare(name.size() - 6, 6, L"_t.dat") == 0) continue;
-                    if (name.size() >= 6 && name.compare(name.size() - 6, 6, L"_h.dat") == 0) continue;
-
-                    std::error_code sec;
-                    auto sz = (long long)fs::file_size(e.path(), sec);
-                    if (sec) continue;
-                    if (wantSize > 0 && sz == wantSize + 31) return e.path().wstring();
-
-                    auto ft = fs::last_write_time(e.path(), sec);
-                    if (sec) continue;
-                    auto sys = std::chrono::system_clock::now() + (ft - fs::file_time_type::clock::now());
-                    long long fts = (long long)std::chrono::system_clock::to_time_t(sys);
-                    long long dd = fts - ts;
-                    if (dd < 0) dd = -dd;
-                    if (dd <= 90 && dd < bestDiff) { bestDiff = dd; bestTime = e.path().wstring(); }
-                }
-            }
-        }
-    }
-    return bestTime;
-}
-
-// 主图 dat → JPEG
-static std::wstring dat_to_jpg(const std::wstring& datPath, uint64_t msgid) {
-    if (g_imgAesKey.size() != 16) return L"";
-    std::string blob = read_file_bin(datPath);
-    if (blob.size() < 64) return L"";
-    if ((unsigned char)blob[0] != 0x07 || (unsigned char)blob[1] != 0x08) return L"";
-
-    std::string ct = blob.substr(15);
-    ct.resize(ct.size() - ct.size() % 16);
-    std::string pt = aes128_ecb_decrypt(g_imgAesKey, ct);
-    if (pt.size() < 64 || pt.compare(0, 4, "wxgf") != 0) return L"";
-    return hevc_blob_to_jpg(pt, msgid);
-}
 
 static std::wstring decode_dat_via_hook(const json& d, long long ts, uint64_t msgid) {
     auto peers = peer_candidates(d);
@@ -1053,21 +968,12 @@ std::wstring resolve_image(const json& d, uint64_t msgid) {
 
     long long wantSize = img_hevc_mid_size(d);
 
-    // ① 配了 image_key：直接解密这条消息自己的主图 dat，最准，也是唯一不依赖微信渲染的路径
-    if (g_imgAesKey.size() == 16) {
-        std::wstring dat = find_img_dat(d, ts, wantSize);
-        if (!dat.empty()) {
-            std::wstring jpg = dat_to_jpg(dat, msgid);
-            if (!jpg.empty()) return jpg;
-        }
-    }
-
-    // ② 明文缩略图（微信在 UI 里渲染过才有）
+    // ① 明文缩略图（微信在 UI 里渲染过才有）
     std::wstring f = find_plain_thumb(d, ts, 3);
     if (f.empty()) f = find_plain_thumb(d, ts, 12);
     if (!f.empty()) return store_for_toast(f, msgid);
 
-    // ③ 微信自己解好的预览（wxgf/HEVC）。用 hevc_mid_size + 文件名秒双重定位，
+    // ② 微信自己解好的预览（wxgf/HEVC）。用 hevc_mid_size + 文件名秒双重定位，
     //    两个特征都取自这条消息本身，不靠"谁和时间戳更接近"去猜。
     std::wstring conv = find_mid_convert(d, ts, wantSize);
     if (!conv.empty()) {
@@ -1742,21 +1648,6 @@ int main(int argc, char** argv) {
     g_imgPreview = g_cfg.value("image_preview", true);
     g_dbgPayload = g_cfg.value("debug_payload", false);
 
-    // 图片 dat 的 AES 密钥：16 字符，或 32 位十六进制（自动转成 16 字节）
-    {
-        std::string k = g_cfg.value("image_key", std::string());
-        if (k.size() == 32) {
-            std::string bin;
-            bool ok = true;
-            for (size_t i = 0; i + 1 < k.size(); i += 2) {
-                try { bin.push_back((char)std::stoi(k.substr(i, 2), nullptr, 16)); }
-                catch (...) { ok = false; break; }
-            }
-            if (ok && bin.size() == 16) g_imgAesKey = bin;
-        } else if (k.size() == 16) {
-            g_imgAesKey = k;
-        }
-    }
 
     // 通知类型
     if (g_cfg.contains("notify_types") && g_cfg["notify_types"].is_array()) {
@@ -1828,10 +1719,6 @@ int main(int argc, char** argv) {
             printf("  [!] 没找到 ffmpeg.exe，图片预览无法转成 JPEG；可放进程序目录或填 ffmpeg_path\n");
         else
             printf("  ffmpeg: %s\n", wtou8(ff).c_str());
-        if (g_imgAesKey.size() == 16)
-            printf("  图片解密: 已配置 image_key（每条图片消息都能解密）\n");
-        else
-            printf("  [!] 未配置 image_key，只能读微信渲染过的缩略图，多数图片会取不到\n");
     }
     // 只打母目录，不把账号目录（含自己的 wxid）写进日志
     for (auto& r : g_wxRoots) {
