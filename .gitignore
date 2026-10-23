@@ -1,0 +1,35 @@
+# ---- 构建产物 ----
+/build/
+/out/
+CMakeCache.txt
+CMakeFiles/
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.vcxproj
+*.vcxproj.filters
+*.slnx
+*.sln
+ALL_BUILD.dir/
+ZERO_CHECK.dir/
+*.dir/
+
+# ---- IDE ----
+/.vs/
+/.vscode/
+*.user
+*.suo
+
+# ---- 本地隐私配置（含真实 wxid，绝不入库） ----
+config.local.json
+*.local.json
+members.local.json
+
+# ---- 临时/日志 ----
+*.log
+*.tmp
+*.bak
+Thumbs.db
+desktop.ini
