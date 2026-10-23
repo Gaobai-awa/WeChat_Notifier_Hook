@@ -348,7 +348,7 @@ Send '{"type":1,"msgid":1,"sender":"wxid_xxxxxxxxxxxx","roomid":"","wxid":"wxid_
 ```
 .
 ├─ src\
-│  ├─ main.cpp        主体（~990 行）
+│  ├─ main.cpp        主体（~1030 行）
 │  ├─ json.hpp        nlohmann/json
 │  └─ httplib.h       cpp-httplib
 ├─ resource.rc        图标资源
