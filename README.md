@@ -282,15 +282,13 @@ WeChat_Notifier_Hook/
 │  └─ httplib.h       cpp-httplib
 ├─ resource.rc        图标资源
 ├─ weixin.ico
-├─ config.json        配置模板（不含任何真实 wxid）
+├─ config.json        配置模板
 ├─ CMakeLists.txt
 ├─ build.bat
 └─ LICENSE
 ```
 
 程序不写任何日志文件，消息只输出到控制台（静默模式下不可见）。
-
-**`config.json` 会包含你自己的 wxid，属于隐私信息。** 提交到 Git 仓库前请确认不要把它和真实 wxid 一起提交。
 
 ---
 
