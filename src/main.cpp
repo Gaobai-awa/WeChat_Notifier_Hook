@@ -16,6 +16,7 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <wincrypt.h>
+#include <bcrypt.h>
 #include <tlhelp32.h>
 #include <shobjidl.h>
 #include <shellapi.h>
@@ -126,14 +127,19 @@ std::unordered_set<int> g_notifyTypes = {
 std::unordered_map<std::string, std::string> g_memberNames;  // wxid -> 昵称（群成员用）
 
 // ==================== 图片预览 ====================
-// 微信 4.x 的图片本体在 msg\attach\<md5(会话)>\<yyyy-MM>\Img\*.dat 里是加密的，
-// 但微信自己会把缩略图以明文缓存在：
-//   cache\<yyyy-MM>\Message\<md5(会话)>\Thumb\<序号>_<Unix秒>_thumb.jpg
-// 通知直接引用这份明文缓存即可 —— 不解密、不读内存、不碰微信进程。
-// 万一缓存没落盘，再退一步调 hook 的 /Decode_Pic 解 dat。
+// 图片本体在 msg\attach\<md5(会话)>\<yyyy-MM>\Img\*.dat，是加密的：
+//   <6 字节魔数 07 08 56 32 08 07><9 字节头><AES-128-ECB 密文>
+// 解密后 *_t.dat 是 JPEG 缩略图，主 *.dat 是 wxgf(内部 HEVC)。
+// 这里按优先级找一张能显示给 Toast 的图：
+//   1. cache\<月>\Message\<md5>\Thumb\*_thumb.jpg —— 微信自己解出来的明文，但只有它在
+//      UI 里渲染过这张图时才存在，不能指望
+//   2. 自己用 image_aeskey 解 *_t.dat（key 每个用户/每条消息都可能不同，只能外部提供）
+//   3. hook 的 /Decode_Pic（不同 hook 版本行为不同，兜底）
 std::atomic<bool> g_imgPreview{true};
+std::atomic<bool> g_dbgPayload{false};    // 把原始推送写进 payload.log，排查用
 std::wstring g_imgDir;                    // 自己管的图片缓存（Toast 引用期间必须存在）
 std::vector<std::wstring> g_wxRoots;      // ...\xwechat_files\<wxid>
+std::string  g_imgAesKey;                 // 图片 dat 的 AES-128 key（16 字符），来自 config
 std::mutex g_imgMtx;
 
 // ==================== 监听范围 ====================
@@ -224,6 +230,11 @@ std::string gen_config_template() {
         "  \"notify_types\": [1, 3, 34, 37, 42, 43, 47, 48, 49, 50, 62, 10000, 10002],\n\n"
         "  // 图片消息：在通知里直接显示图片\n"
         "  \"image_preview\": true,\n\n"
+        "  // 微信的图片预览是 wxgf(HEVC) 格式，需要 ffmpeg 取一帧转成 JPEG。\n"
+        "  // 留空则依次找：程序目录\\ffmpeg.exe、程序目录\\bin\\ffmpeg.exe、PATH\n"
+        "  \"ffmpeg_path\": \"\",\n\n"
+        "  // 排查用：把收到的原始推送写进程序目录的 payload.log\n"
+        "  \"debug_payload\": false,\n\n"
         "  // 微信数据目录，留空自动探测（一般不用填）\n"
         "  \"wx_data_root\": \"\",\n\n"
         "  // 开机自动启动\n"
@@ -643,6 +654,178 @@ static std::wstring find_dat_near(const std::wstring& dir, long long ts, long lo
     return best;
 }
 
+// ---------- wxgf / 裸 HEVC → JPEG ----------
+// 微信 4.x 收到图片后，除了加密的 .dat，还会在
+//   cache\<月>\Message\<md5>\ImageTemp\<序号>_<Unix秒>_mid_temp_convert
+// 放一份它自己解好的预览：wxgf 头 + 裸 HEVC 码流（Main Still Picture）。
+// 这是微信现成的解密产物，不需要任何密钥，剥掉头交给 ffmpeg 取第一帧即可。
+static std::wstring g_ffmpegPath;
+
+static bool file_exists_w(const std::wstring& p) {
+    std::error_code ec;
+    return fs::is_regular_file(p, ec);
+}
+
+// 找不到就返回空，调用方自然退到文字通知
+static std::wstring find_ffmpeg() {
+    if (!g_ffmpegPath.empty()) return g_ffmpegPath;
+
+    auto take = [](const std::wstring& p) -> bool {
+        if (!file_exists_w(p)) return false;
+        g_ffmpegPath = p;
+        return true;
+    };
+
+    std::string cfg = g_cfg.value("ffmpeg_path", std::string());
+    if (!cfg.empty() && take(u8tow(cfg))) return g_ffmpegPath;
+
+    if (take(u8tow(g_exeDir) + L"ffmpeg.exe"))      return g_ffmpegPath;
+    if (take(u8tow(g_exeDir) + L"bin\\ffmpeg.exe")) return g_ffmpegPath;
+
+    wchar_t buf[MAX_PATH * 2];
+    if (SearchPathW(nullptr, L"ffmpeg.exe", nullptr, MAX_PATH * 2, buf, nullptr) > 0)
+        if (take(buf)) return g_ffmpegPath;
+
+    return L"";
+}
+
+// 用 CreateProcess 跑 ffmpeg，不弹黑窗，超时就放弃（不能卡住通知线程）
+static bool run_hidden(const std::wstring& cmdline, DWORD timeoutMs) {
+    std::wstring cmd = cmdline;              // CreateProcessW 要求可写缓冲
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+        return false;
+    DWORD r = WaitForSingleObject(pi.hProcess, timeoutMs);
+    if (r != WAIT_OBJECT_0) {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 1000);
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return r == WAIT_OBJECT_0;
+}
+
+// wxgf（或任何以 Annex-B 起始码开头的 HEVC 缓冲）→ 一张 JPEG
+static std::wstring hevc_blob_to_jpg(const std::string& blob, uint64_t msgid) {
+    std::wstring ff = find_ffmpeg();
+    if (ff.empty() || blob.size() < 256) return L"";
+
+    static const char SC[4] = { 0, 0, 0, 1 };
+    size_t pos = blob.find(std::string(SC, 4), 0);
+    if (pos == std::string::npos || pos > 512 || blob.size() - pos < 128) return L"";
+
+    std::error_code ec;
+    fs::create_directories(g_imgDir, ec);
+    wchar_t base[80];
+    swprintf_s(base, L"img_%llu", (unsigned long long)(msgid ? msgid : (uint64_t)time(nullptr)));
+    std::wstring tmp = g_imgDir + L"\\" + base + L".hevc";
+    std::wstring dst = g_imgDir + L"\\" + base + L".jpg";
+
+    {
+        std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
+        if (!o) return L"";
+        o.write(blob.data() + pos, (std::streamsize)(blob.size() - pos));
+        if (!o) { }          // 写完再检查一次
+    }
+    DeleteFileW(dst.c_str());
+
+    std::wstring cmd = L"\"" + ff + L"\" -hide_banner -loglevel error -y -f hevc -i \"" +
+                       tmp + L"\" -frames:v 1 -q:v 3 \"" + dst + L"\"";
+    bool ran = run_hidden(cmd, 8000);
+
+    std::error_code sec;
+    auto sz = fs::file_size(dst, sec);
+    fs::remove(tmp, sec);                       // 中间文件立刻清掉
+    if (!ran || sec || sz < 512) {
+        DeleteFileW(dst.c_str());
+        return L"";
+    }
+    return dst;
+}
+
+// 定位微信自己生成的那份预览（文件名里带图片消息的 Unix 秒）
+static std::wstring find_mid_convert(const json& d, long long ts, long long tolSec) {
+    auto peers = peer_candidates(d);
+    std::wstring months[3] = { month_of(ts), month_of(ts, -1), month_of(ts, 1) };
+
+    for (auto& root : g_wxRoots) {
+        for (auto& m : months) {
+            for (auto& p : peers) {
+                std::string md5 = md5_hex(p);
+                if (md5.empty()) continue;
+                std::wstring dir = root + L"\\cache\\" + m + L"\\Message\\" +
+                                   u8tow(md5) + L"\\ImageTemp";
+                std::error_code ec;
+                if (!fs::is_directory(dir, ec)) continue;
+
+                std::wstring best;
+                long long bestDiff = LLONG_MAX;
+                for (auto& e : fs::directory_iterator(dir, ec)) {
+                    if (ec) break;
+                    if (!e.is_regular_file(ec)) continue;
+                    auto name = e.path().filename().wstring();
+                    auto up = name.rfind(L"_mid_temp_convert");
+                    if (up == std::wstring::npos) continue;
+                    auto us = name.rfind(L'_', up - 1);
+                    if (us == std::wstring::npos) continue;
+                    long long fts = 0;
+                    try { fts = std::stoll(name.substr(us + 1, up - us - 1)); } catch (...) { continue; }
+                    long long dd = (fts > ts) ? (fts - ts) : (ts - fts);
+                    if (dd <= tolSec && dd < bestDiff) { bestDiff = dd; best = e.path().wstring(); }
+                }
+                if (!best.empty()) return best;
+            }
+        }
+    }
+    return L"";
+}
+
+// 兜底：推送里的 timestamp 和文件名里的对不上时，退而求其次——
+// 在这个会话的 ImageTemp 里找刚刚生成的那一份（限定 maxAgeSec 内最新）。
+static std::wstring find_mid_convert_recent(const json& d, long long maxAgeSec) {
+    auto peers = peer_candidates(d);
+    long long now = (long long)time(nullptr);
+    std::wstring best;
+    long long bestT = 0;
+
+    for (auto& root : g_wxRoots) {
+        for (auto& p : peers) {
+            std::string md5 = md5_hex(p);
+            if (md5.empty()) continue;
+            for (int off : { 0, -1, 1 }) {
+                std::wstring dir = root + L"\\cache\\" + month_of(now, off) +
+                                   L"\\Message\\" + u8tow(md5) + L"\\ImageTemp";
+                std::error_code ec;
+                if (!fs::is_directory(dir, ec)) continue;
+                for (auto& e : fs::directory_iterator(dir, ec)) {
+                    if (ec) break;
+                    if (!e.is_regular_file(ec)) continue;
+                    auto name = e.path().filename().wstring();
+                    if (name.find(L"_mid_temp_convert") == std::wstring::npos) continue;
+                    auto ft = fs::last_write_time(e.path(), ec);
+                    if (ec) continue;
+                    auto sys = std::chrono::system_clock::now() + (ft - fs::file_time_type::clock::now());
+                    long long fts = (long long)std::chrono::system_clock::to_time_t(sys);
+                    long long age = now - fts;
+                    if (age < 0) age = 0;
+                    if (age <= maxAgeSec && fts > bestT) { bestT = fts; best = e.path().wstring(); }
+                }
+            }
+        }
+    }
+    return best;
+}
+
+static std::string read_file_bin(const std::wstring& p) {    std::ifstream f(p, std::ios::binary);
+    if (!f) return std::string();
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
 static std::wstring decode_dat_via_hook(const json& d, long long ts, uint64_t msgid) {
     auto peers = peer_candidates(d);
     std::wstring src;
@@ -727,6 +910,16 @@ std::wstring resolve_image(const json& d, uint64_t msgid) {
     if (f.empty()) f = find_plain_thumb(d, ts, 12);
     if (!f.empty()) return store_for_toast(f, msgid);
 
+    // 微信自己解好的预览（wxgf/HEVC）：文件名里就是这条消息的时间戳，先说 ±8 秒
+    std::wstring conv = find_mid_convert(d, ts, 8);
+    if (conv.empty()) conv = find_mid_convert(d, ts, 120);
+    if (conv.empty()) conv = find_mid_convert(d, ts, 600);
+    if (conv.empty()) conv = find_mid_convert_recent(d, 240);   // 文件名时间戳对不上时
+    if (!conv.empty()) {
+        std::wstring jpg = hevc_blob_to_jpg(read_file_bin(conv), msgid);
+        if (!jpg.empty()) return jpg;
+    }
+
     return decode_dat_via_hook(d, ts, msgid);
 }
 
@@ -734,7 +927,13 @@ std::wstring resolve_image(const json& d, uint64_t msgid) {
 // 异步化：hook 的 HTTP 推送在 httplib 工作线程里处理，
 // 如果在这里同步等 PowerShell（最多 6 秒），会把工作线程占死，
 // 后续推送全部排队。改成入队 + 专门的工作线程消费。
-struct ToastItem { std::string title, body; std::wstring image; };
+struct ToastItem {
+    std::string title, body;
+    std::wstring image;
+    json     data;               // 图片消息：把原始推送留下来，到工作线程再解析
+    uint64_t msgid = 0;
+    bool     wantImage = false;
+};
 std::mutex              g_toastMtx;
 std::condition_variable g_toastCv;
 std::deque<ToastItem>   g_toastQueue;
@@ -747,6 +946,22 @@ void enqueue_toast(const std::string& t, const std::string& b, const std::wstrin
         // 积压上限：真刷屏时丢掉最老的，避免无限增长
         if (g_toastQueue.size() >= 32) g_toastQueue.pop_front();
         g_toastQueue.push_back({t, b, img});
+    }
+    g_toastCv.notify_one();
+}
+
+// 图片消息走这个：解析（可能要等微信写文件、要跑 ffmpeg）全放到工作线程
+void enqueue_toast_image(const std::string& t, const std::string& b, const json& d, uint64_t msgid) {
+    {
+        std::lock_guard<std::mutex> lk(g_toastMtx);
+        if (g_toastQueue.size() >= 32) g_toastQueue.pop_front();
+        ToastItem it;
+        it.title = t;
+        it.body  = b;
+        it.data  = d;
+        it.msgid = msgid;
+        it.wantImage = true;
+        g_toastQueue.push_back(std::move(it));
     }
     g_toastCv.notify_one();
 }
@@ -858,6 +1073,22 @@ static void toast_worker_loop() {
             if (!g_running && g_toastQueue.empty()) return;
             item = std::move(g_toastQueue.front());
             g_toastQueue.pop_front();
+        }
+        if (item.wantImage) {
+            // 微信是在收到消息前后才把预览写盘的，稍等一下再找；
+            // 这段（含 ffmpeg）放在工作线程，HTTP 推送回调不会被拖住
+            for (int attempt = 0; attempt < 3 && item.image.empty(); ++attempt) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(attempt ? 1200 : 500));
+                item.image = resolve_image(item.data, item.msgid);
+            }
+            item.data = json();
+            if (!item.image.empty()) {
+                SYSTEMTIME st;
+                GetLocalTime(&st);
+                printf("[%02d:%02d:%02d] [%s] %s  [图片已附]\n", st.wHour, st.wMinute, st.wSecond,
+                       item.title.c_str(), item.body.c_str());
+                fflush(stdout);
+            }
         }
         send_toast_now(item.title, item.body, item.image);
     }
@@ -1026,13 +1257,26 @@ void handle_push(const json& d) {
     if (type == 51) return;
     if (!g_notifyTypes.count(type)) return;
 
-    std::string peer     = d.value("wxid", std::string());      // 会话对方（私聊）
-    std::string sender   = d.value("sender", std::string());
+    std::string selfwx   = d.value("wxid", std::string());      // 本机登录账号
+    std::string sender   = d.value("sender", std::string());    // 实际发送者
     std::string roomid   = d.value("roomid", std::string());
+    // 私聊的「对方」是 sender；wxid 是登录账号自己，拿它去匹配永远对不上。
+    // 少数 hook 版本不带 sender，这时才退回 wxid。
+    std::string peer     = (!sender.empty() && sender != selfwx) ? sender : selfwx;
     std::string content  = d.value("content", std::string());
     uint64_t    msgid    = d.value("msgid", 0ULL);
 
     if (content.empty() && type == 1) return;
+
+    // 调试：把原始推送原样记一份（排查图片路径/字段问题时用，默认关闭）
+    if (g_dbgPayload.load()) {
+        static std::mutex dbgMtx;
+        std::lock_guard<std::mutex> lk(dbgMtx);
+        std::string line = d.dump();
+        for (auto& c : line) if (c == '\n' || c == '\r') c = ' ';
+        std::ofstream f(fs::path(u8tow(g_exeDir) + L"payload.log"), std::ios::binary | std::ios::app);
+        if (f) f << line << "\n";
+    }
 
     // ===== 按监听范围决定这条消息要不要通知 =====
     WatchMode mode = (WatchMode)g_watchMode.load();
@@ -1091,20 +1335,20 @@ void handle_push(const json& d) {
 
     if (body.empty()) return;
 
-    // 图片消息：先找微信自己缓存的明文缩略图，没有就让 hook 解一次 dat。
-    // 全程只读文件 + 调 hook 的 HTTP 接口，不注入、不读内存、不重启微信。
-    std::wstring img;
-    if (type == 3 && g_imgPreview.load()) img = resolve_image(d, msgid);
-
-    // 只输出到控制台，不写文件
+    // 图片消息：找图这一步（可能等微信落盘、可能跑 ffmpeg）交给 toast 工作线程，
+    // 这里只把原始推送转过去，立刻返回。
+    // 全程只读微信的缓存文件 + 调 hook 的 HTTP 接口，不注入、不读内存、不重启微信。
     SYSTEMTIME st;
     GetLocalTime(&st);
-    printf("[%02d:%02d:%02d] [%s] %s%s\n", st.wHour, st.wMinute, st.wSecond,
-           title.c_str(), body.c_str(), img.empty() ? "" : "  [图片已附]");
+    printf("[%02d:%02d:%02d] [%s] %s\n", st.wHour, st.wMinute, st.wSecond,
+           title.c_str(), body.c_str());
     fflush(stdout);
 
-    // 入队，立刻返回 —— 不阻塞 httplib 工作线程
-    enqueue_toast(title, body, img);
+    if (type == 3 && g_imgPreview.load()) {
+        enqueue_toast_image(title, body, d, msgid);
+    } else {
+        enqueue_toast(title, body);
+    }
 }
 
 // ==================== 启动推送服务 ====================
@@ -1333,6 +1577,7 @@ int main(int argc, char** argv) {
     }
 
     g_imgPreview = g_cfg.value("image_preview", true);
+    g_dbgPayload = g_cfg.value("debug_payload", false);
 
     // 通知类型
     if (g_cfg.contains("notify_types") && g_cfg["notify_types"].is_array()) {
@@ -1398,6 +1643,13 @@ int main(int argc, char** argv) {
            (int)g_wxRoots.size());
     if (g_imgPreview && g_wxRoots.empty())
         printf("  [!] 未探测到微信数据目录，图片通知会退化成文字；可在 config.json 填 wx_data_root\n");
+    if (g_imgPreview) {
+        std::wstring ff = find_ffmpeg();
+        if (ff.empty())
+            printf("  [!] 没找到 ffmpeg.exe，图片预览无法转成 JPEG；可放进程序目录或填 ffmpeg_path\n");
+        else
+            printf("  ffmpeg: %s\n", wtou8(ff).c_str());
+    }
     // 只打母目录，不把账号目录（含自己的 wxid）写进日志
     for (auto& r : g_wxRoots) {
         fs::path p(r);

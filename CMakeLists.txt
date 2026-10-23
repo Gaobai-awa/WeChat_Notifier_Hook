@@ -31,6 +31,7 @@ target_link_libraries(WeChatNotifier PRIVATE
     runtimeobject
     user32
     advapi32
+    bcrypt
 )
 
 set_target_properties(WeChatNotifier PROPERTIES

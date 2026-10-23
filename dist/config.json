@@ -1,5 +1,7 @@
 {
     "autostart": false,
+    "debug_payload": false,
+    "ffmpeg_path": "",
     "hook_api": "http://127.0.0.1:30001",
     "image_preview": true,
     "language": "zh_cn",
