@@ -1,6 +1,7 @@
 {
     "autostart": false,
     "hook_api": "http://127.0.0.1:30001",
+    "image_preview": true,
     "language": "zh_cn",
     "listen_port": 8899,
     "members": {},
@@ -27,5 +28,6 @@
             "wxid": "wxid_xxxxxxxxxxxx"
         }
     ],
-    "watch_mode": 2
+    "watch_mode": 2,
+    "wx_data_root": ""
 }

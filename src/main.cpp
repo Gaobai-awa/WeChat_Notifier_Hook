@@ -15,6 +15,7 @@
 
 #include <windows.h>
 #include <winhttp.h>
+#include <wincrypt.h>
 #include <tlhelp32.h>
 #include <shobjidl.h>
 #include <shellapi.h>
@@ -69,6 +70,7 @@ std::unordered_map<std::string, std::unordered_map<std::string, std::string>> D 
         {"status","状态"},{"retry","重连中..."},
         {"watch_scope","监听范围"},
         {"scope_all","所有人"},{"scope_private","仅私聊"},{"scope_config","Config 内用户"},
+        {"image_preview","图片通知"},{"img_on","开"},{"img_off","关"},{"wx_root","微信数据"},
     }},
     {"zh_tw", {
         {"banner","WeChat Notifier (Hook)"},{"target","監聽"},{"listen","監聽埠"},
@@ -81,6 +83,7 @@ std::unordered_map<std::string, std::unordered_map<std::string, std::string>> D 
         {"status","狀態"},{"retry","重新連線中..."},
         {"watch_scope","監聽範圍"},
         {"scope_all","所有人"},{"scope_private","僅私聊"},{"scope_config","Config 內用戶"},
+        {"image_preview","圖片通知"},{"img_on","開"},{"img_off","關"},{"wx_root","微信資料"},
     }},
     {"en_us", {
         {"banner","WeChat Notifier (Hook)"},{"target","target"},{"listen","listen port"},
@@ -93,6 +96,7 @@ std::unordered_map<std::string, std::unordered_map<std::string, std::string>> D 
         {"status","status"},{"retry","reconnecting..."},
         {"watch_scope","watch scope"},
         {"scope_all","everyone"},{"scope_private","private only"},{"scope_config","config users"},
+        {"image_preview","image preview"},{"img_on","on"},{"img_off","off"},{"wx_root","wechat data"},
     }},
 };
 std::string _(const std::string& k) { auto& d = D.count(g_lang) ? D[g_lang] : D["en_us"]; return d.count(k) ? d[k] : k; }
@@ -120,6 +124,17 @@ std::unordered_set<int> g_notifyTypes = {
     1, 3, 34, 37, 42, 43, 47, 48, 49, 50, 62, 10000, 10002
 };
 std::unordered_map<std::string, std::string> g_memberNames;  // wxid -> 昵称（群成员用）
+
+// ==================== 图片预览 ====================
+// 微信 4.x 的图片本体在 msg\attach\<md5(会话)>\<yyyy-MM>\Img\*.dat 里是加密的，
+// 但微信自己会把缩略图以明文缓存在：
+//   cache\<yyyy-MM>\Message\<md5(会话)>\Thumb\<序号>_<Unix秒>_thumb.jpg
+// 通知直接引用这份明文缓存即可 —— 不解密、不读内存、不碰微信进程。
+// 万一缓存没落盘，再退一步调 hook 的 /Decode_Pic 解 dat。
+std::atomic<bool> g_imgPreview{true};
+std::wstring g_imgDir;                    // 自己管的图片缓存（Toast 引用期间必须存在）
+std::vector<std::wstring> g_wxRoots;      // ...\xwechat_files\<wxid>
+std::mutex g_imgMtx;
 
 // ==================== 监听范围 ====================
 // ALL      = 所有人（群聊 + 私聊 + 公众号全收）
@@ -207,6 +222,10 @@ std::string gen_config_template() {
         "  //   47=表情 48=位置 49=卡片 50=通话 62=视频(另一路) 10000/10002=系统\n"
         "  // 留着全部即可；想只收文本就改成 [1]\n"
         "  \"notify_types\": [1, 3, 34, 37, 42, 43, 47, 48, 49, 50, 62, 10000, 10002],\n\n"
+        "  // 图片消息：在通知里直接显示图片\n"
+        "  \"image_preview\": true,\n\n"
+        "  // 微信数据目录，留空自动探测（一般不用填）\n"
+        "  \"wx_data_root\": \"\",\n\n"
         "  // 开机自动启动\n"
         "  \"autostart\": false,\n\n"
         "  // 静默运行（隐藏控制台）\n"
@@ -429,40 +448,391 @@ void run_tray_loop() {
     if (g_trayHwnd) DestroyWindow(g_trayHwnd);
 }
 
+// ==================== 图片：定位微信的明文缩略图 ====================
+// 前向声明：图片兜底要调 hook，实现在后面
+std::string http_post_json(const std::string& host, int port, const std::string& path,
+                           const std::string& body, int timeoutSec);
+
+std::string md5_hex(const std::string& in) {
+    std::string out;
+    HCRYPTPROV prov = 0;
+    HCRYPTHASH h = 0;
+    if (!CryptAcquireContextW(&prov, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
+        return out;
+    if (CryptCreateHash(prov, CALG_MD5, 0, 0, &h)) {
+        if (CryptHashData(h, (const BYTE*)in.data(), (DWORD)in.size(), 0)) {
+            BYTE dig[16] = {};
+            DWORD len = sizeof(dig);
+            if (CryptGetHashParam(h, HP_HASHVAL, dig, &len, 0)) {
+                char buf[33] = {};
+                for (int i = 0; i < 16; i++) sprintf_s(buf + i * 2, 3, "%02x", dig[i]);
+                out.assign(buf, 32);
+            }
+        }
+        CryptDestroyHash(h);
+    }
+    CryptReleaseContext(prov, 0);
+    return out;
+}
+
+// 微信把「文件保存位置」的一级目录写在 %APPDATA%\Tencent\xwechat\config\<hash>.ini 的第一行
+static void add_roots_from(const std::wstring& base) {
+    std::error_code ec;
+    fs::path p(base);
+    if (!fs::is_directory(p, ec)) return;
+    fs::path cand = (p.filename() == L"xwechat_files") ? p : (p / L"xwechat_files");
+    if (!fs::is_directory(cand, ec)) return;
+    for (auto& e : fs::directory_iterator(cand, ec)) {
+        if (ec) break;
+        if (!e.is_directory(ec)) continue;
+        auto name = e.path().filename().wstring();
+        if (name.rfind(L"wxid_", 0) != 0) continue;
+        std::wstring full = e.path().wstring();
+        if (std::find(g_wxRoots.begin(), g_wxRoots.end(), full) == g_wxRoots.end())
+            g_wxRoots.push_back(full);
+    }
+}
+
+void detect_wx_roots() {
+    // 1. config.json 里手填的（优先级最高，填哪个用哪个）
+    std::string cfgRoot = g_cfg.value("wx_data_root", std::string());
+    if (!cfgRoot.empty()) add_roots_from(u8tow(cfgRoot));
+
+    // 2. 微信自己的配置目录
+    wchar_t ad[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, ad))) {
+        std::error_code ec;
+        fs::path cfgDir = fs::path(ad) / L"Tencent" / L"xwechat" / L"config";
+        if (fs::is_directory(cfgDir, ec)) {
+            for (auto& e : fs::directory_iterator(cfgDir, ec)) {
+                if (ec) break;
+                if (!e.is_regular_file(ec) || e.path().extension() != L".ini") continue;
+                std::ifstream in(e.path());
+                std::string line;
+                if (!std::getline(in, line)) continue;
+                int wl = MultiByteToWideChar(CP_ACP, 0, line.c_str(), -1, nullptr, 0);
+                if (wl <= 1) continue;
+                std::wstring wline(wl, L'\0');
+                MultiByteToWideChar(CP_ACP, 0, line.c_str(), -1, &wline[0], wl);
+                wline.resize(wl - 1);
+                size_t b = wline.find_first_not_of(L" \t\r\n");
+                if (b == std::wstring::npos) continue;
+                wline = wline.substr(b);
+                while (!wline.empty() && (wline.back() == L' ' || wline.back() == L'\r' || wline.back() == L'\t'))
+                    wline.pop_back();
+                add_roots_from(wline);
+            }
+        }
+    }
+
+    // 3. 文档目录（4.x 默认位置）
+    wchar_t doc[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_PERSONAL, NULL, 0, doc))) {
+        add_roots_from(doc);
+        add_roots_from(std::wstring(doc) + L"\\xwechat_files");
+    }
+}
+
+// 消息时间戳 → "yyyy-MM"（缓存目录按本地月份分）
+static std::wstring month_of(long long tsSec, int addMonths = 0) {
+    time_t t = (time_t)tsSec;
+    struct tm tmv = {};
+    localtime_s(&tmv, &t);
+    int y = tmv.tm_year + 1900, m = tmv.tm_mon + 1 + addMonths;
+    while (m <= 0) { m += 12; y--; }
+    while (m > 12) { m -= 12; y++; }
+    wchar_t buf[16];
+    swprintf_s(buf, L"%04d-%02d", y, m);
+    return buf;
+}
+
+// 目录里找 <序号>_<Unix秒>_thumb.jpg，取时间戳最接近的
+static std::wstring find_thumb_in(const std::wstring& dir, long long ts, long long tolSec) {
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) return L"";
+    std::wstring best;
+    long long bestDiff = LLONG_MAX;
+    for (auto& e : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!e.is_regular_file(ec)) continue;
+        auto name = e.path().filename().wstring();
+        auto p = name.rfind(L"_thumb");
+        if (p == std::wstring::npos) continue;
+        auto u = name.rfind(L'_', p - 1);
+        if (u == std::wstring::npos) continue;
+        long long fts = 0;
+        try { fts = std::stoll(name.substr(u + 1, p - u - 1)); } catch (...) { continue; }
+        long long d = (fts > ts) ? (fts - ts) : (ts - fts);
+        if (d <= tolSec && d < bestDiff) { bestDiff = d; best = e.path().wstring(); }
+    }
+    return best;
+}
+
+// 全部都猜不到会话目录时，扫整月所有会话（几十个目录，可接受）
+static std::wstring scan_message_dir(const std::wstring& monthMsgDir, long long ts, long long tolSec) {
+    std::error_code ec;
+    if (!fs::is_directory(monthMsgDir, ec)) return L"";
+    for (auto& e : fs::directory_iterator(monthMsgDir, ec)) {
+        if (ec) break;
+        if (!e.is_directory(ec)) continue;
+        auto f = find_thumb_in((e.path() / L"Thumb").wstring(), ts, tolSec);
+        if (!f.empty()) return f;
+    }
+    return L"";
+}
+
+// 推送里可能的会话标识：群用 roomid，私聊用 sender；
+// 不同 hook 版本的 wxid 字段含义不一致，config 里的对象也一并当候选。
+static std::vector<std::string> peer_candidates(const json& d) {
+    std::vector<std::string> v;
+    auto add = [&](const std::string& s) {
+        if (!s.empty() && std::find(v.begin(), v.end(), s) == v.end()) v.push_back(s);
+    };
+    add(d.value("roomid", std::string()));
+    add(d.value("sender", std::string()));
+    add(d.value("wxid", std::string()));
+    for (auto& [id, w] : g_watch) add(id);
+    return v;
+}
+
+// 在 cache\<月>\Message\<md5>\Thumb 里找文图；找不到返回空
+static std::wstring find_plain_thumb(const json& d, long long ts, long long tolSec) {
+    auto peers = peer_candidates(d);
+    std::wstring months[3] = { month_of(ts), month_of(ts, -1), month_of(ts, 1) };
+
+    for (auto& root : g_wxRoots) {
+        for (auto& m : months) {
+            std::wstring msgDir = root + L"\\cache\\" + m + L"\\Message";
+            for (auto& p : peers) {
+                std::string md5 = md5_hex(p);
+                if (md5.empty()) continue;
+                auto f = find_thumb_in(msgDir + L"\\" + u8tow(md5) + L"\\Thumb", ts, tolSec);
+                if (!f.empty()) return f;
+            }
+        }
+    }
+    // 候选都没命中 → 整月兜底
+    for (auto& root : g_wxRoots) {
+        for (auto& m : months) {
+            auto f = scan_message_dir(root + L"\\cache\\" + m + L"\\Message", ts, tolSec);
+            if (!f.empty()) return f;
+        }
+    }
+    return L"";
+}
+
+// 兜底：从 attach 目录找缩略图 dat，让 hook 在微信进程内解一次
+static std::wstring find_dat_near(const std::wstring& dir, long long ts, long long tolSec) {
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) return L"";
+    std::wstring best;
+    long long bestDiff = LLONG_MAX;
+    for (auto& e : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!e.is_regular_file(ec)) continue;
+        auto name = e.path().filename().wstring();
+        if (name.size() < 4 || name.substr(name.size() - 4) != L".dat") continue;
+        auto ft = fs::last_write_time(e.path(), ec);
+        if (ec) continue;
+        // 用文件修改时间与消息时间对齐；转换到 time_t 后按秒比较
+        auto sys = std::chrono::system_clock::now() + (ft - fs::file_time_type::clock::now());
+        long long fts = (long long)std::chrono::system_clock::to_time_t(sys);
+        long long dd = (fts > ts) ? (fts - ts) : (ts - fts);
+        if (dd <= tolSec && dd < bestDiff) { bestDiff = dd; best = e.path().wstring(); }
+    }
+    return best;
+}
+
+static std::wstring decode_dat_via_hook(const json& d, long long ts, uint64_t msgid) {
+    auto peers = peer_candidates(d);
+    std::wstring src;
+    for (auto& root : g_wxRoots) {
+        for (auto& p : peers) {
+            std::string md5 = md5_hex(p);
+            if (md5.empty()) continue;
+            std::wstring dir = root + L"\\msg\\attach\\" + u8tow(md5) + L"\\" + month_of(ts) + L"\\Img";
+            src = find_dat_near(dir, ts, 90);
+            if (!src.empty()) break;
+        }
+        if (!src.empty()) break;
+    }
+    if (src.empty()) return L"";
+
+    std::error_code ec;
+    fs::create_directories(g_imgDir, ec);
+    wchar_t name[64];
+    swprintf_s(name, L"dec_%llu.jpg", (unsigned long long)msgid);
+    std::wstring dst = g_imgDir + L"\\" + name;
+    DeleteFileW(dst.c_str());
+
+    json body = { {"src_path", wtou8(src)}, {"dst_path", wtou8(dst)} };
+    http_post_json(g_hookHost, g_hookPort, "/Decode_Pic", body.dump(), 2);
+
+    // 这个接口不管成败都回 success，只能看文件到底出来了没有
+    std::error_code szec;
+    auto sz = fs::file_size(dst, szec);
+    if (szec || sz == 0) return L"";
+    return dst;
+}
+
+static std::atomic<long long> g_lastImgClean{0};
+
+// 拷进自己管的目录：Toast 是异步取图的，微信缓存随时可能被清
+static std::wstring store_for_toast(const std::wstring& src, uint64_t msgid) {
+    if (src.empty()) return L"";
+    std::error_code ec;
+    fs::create_directories(g_imgDir, ec);
+
+    long long now = (long long)time(nullptr);
+    long long last = g_lastImgClean.load();
+    if (now - last > 300 && g_lastImgClean.compare_exchange_strong(last, now)) {
+        for (auto& e : fs::directory_iterator(g_imgDir, ec)) {
+            if (ec) break;
+            if (!e.is_regular_file(ec)) continue;
+            auto ft = fs::last_write_time(e.path(), ec);
+            if (ec) continue;
+            auto sys = std::chrono::system_clock::now() + (ft - fs::file_time_type::clock::now());
+            long long age = now - (long long)std::chrono::system_clock::to_time_t(sys);
+            if (age > 7200) fs::remove(e.path(), ec);
+        }
+    }
+
+    wchar_t name[64];
+    swprintf_s(name, L"%llu.jpg", (unsigned long long)(msgid ? msgid : (uint64_t)now));
+    std::wstring dst = g_imgDir + L"\\" + name;
+    if (!CopyFileW(src.c_str(), dst.c_str(), FALSE)) return L"";
+
+    // CopyFile 会把源文件的修改时间一起搬过来。清理按修改时间算年龄，
+    // 不重置的话刚拷进来的图会立刻被当成两天前的旧文件删掉。
+    HANDLE h = CreateFileW(dst.c_str(), FILE_WRITE_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        SetFileTime(h, nullptr, nullptr, &ft);
+        CloseHandle(h);
+    }
+    return dst;
+}
+
+// 主入口：拿到一条图片消息，尽力找一张可用的明文图；找不到返回空（照常发纯文字通知）
+std::wstring resolve_image(const json& d, uint64_t msgid) {
+    long long ts = (long long)d.value("timestamp", 0LL);
+    if (ts <= 0) ts = (long long)time(nullptr);
+    if (ts > 100000000000LL) ts /= 1000;   // 防御：万一给了毫秒
+
+    // 先严后松：±3 秒精确命中，再放宽到 ±12 秒，最后整月兜底
+    std::wstring f = find_plain_thumb(d, ts, 3);
+    if (f.empty()) f = find_plain_thumb(d, ts, 12);
+    if (!f.empty()) return store_for_toast(f, msgid);
+
+    return decode_dat_via_hook(d, ts, msgid);
+}
+
 // ==================== Toast ====================
 // 异步化：hook 的 HTTP 推送在 httplib 工作线程里处理，
 // 如果在这里同步等 PowerShell（最多 6 秒），会把工作线程占死，
 // 后续推送全部排队。改成入队 + 专门的工作线程消费。
-struct ToastItem { std::string title, body; };
+struct ToastItem { std::string title, body; std::wstring image; };
 std::mutex              g_toastMtx;
 std::condition_variable g_toastCv;
 std::deque<ToastItem>   g_toastQueue;
 
 static void toast_worker_loop();
 
-void enqueue_toast(const std::string& t, const std::string& b) {
+void enqueue_toast(const std::string& t, const std::string& b, const std::wstring& img = L"") {
     {
         std::lock_guard<std::mutex> lk(g_toastMtx);
         // 积压上限：真刷屏时丢掉最老的，避免无限增长
         if (g_toastQueue.size() >= 32) g_toastQueue.pop_front();
-        g_toastQueue.push_back({t, b});
+        g_toastQueue.push_back({t, b, img});
     }
     g_toastCv.notify_one();
 }
 
+static std::wstring xml_escape(const std::wstring& s) {
+    std::wstring o;
+    o.reserve(s.size() + 8);
+    for (wchar_t c : s) {
+        switch (c) {
+            case L'&':  o += L"&amp;";  break;
+            case L'<':  o += L"&lt;";   break;
+            case L'>':  o += L"&gt;";   break;
+            case L'"':  o += L"&quot;"; break;
+            case L'\'': o += L"&apos;"; break;
+            default:    o += c;
+        }
+    }
+    return o;
+}
+
 // 真正拉起 PowerShell 的那一步（只在 toast 工作线程里跑）
-static void send_toast_now(const std::string& t, const std::string& b) {
+static void send_toast_now(const std::string& t, const std::string& b, const std::wstring& image) {
     std::wstring wt = u8tow(t), wb = u8tow(b);
-    // PowerShell 单引号字符串里，单引号要换成右单引号避免语法错误
-    for (auto& c : wt) if (c == L'\'') c = L'\u2019';
-    for (auto& c : wb) if (c == L'\'') c = L'\u2019';
+
+    // 有图就走 ToastGeneric（能放图）；没图沿用原来的 ToastText02
+    if (image.empty()) {
+        for (auto& c : wt) if (c == L'\'') c = L'\u2019';
+        for (auto& c : wb) if (c == L'\'') c = L'\u2019';
+
+        std::wstring ps =
+            L"[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]|Out-Null;"
+            L"$x=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+            L"$n=$x.GetElementsByTagName('text');"
+            L"$n.Item(0).AppendChild($x.CreateTextNode('" + wt + L"'))|Out-Null;"
+            L"$n.Item(1).AppendChild($x.CreateTextNode('" + wb + L"'))|Out-Null;"
+            L"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('" + std::wstring(AUMID) +
+            L"').Show([Windows.UI.Notifications.ToastNotification]::new($x))";
+
+        STARTUPINFOW si = { sizeof(si) };
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi = {};
+        std::wstring cmd = L"powershell -NoP -Command \"" + ps + L"\"";
+        if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, 6000);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+        return;
+    }
+
+    // ---- 带图 ----
+    std::wstring uri = L"file:///" + image;
+    for (auto& c : uri) if (c == L'\\') c = L'/';
+
+    std::wstring xml =
+        L"<toast><visual><binding template=\"ToastGeneric\">"
+        L"<text>" + xml_escape(wt) + L"</text>"
+        L"<text>" + xml_escape(wb) + L"</text>"
+        L"<image src=\"" + xml_escape(uri) + L"\" placement=\"hero\" hint-crop=\"none\" alt=\"图片\"/>"
+        L"</binding></visual></toast>";
+
+    // XML 走临时文件：正文里的引号、换行、特殊字符都不用再操心转义层级
+    wchar_t tmpDir[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, tmpDir);
+    wchar_t xmlFile[MAX_PATH] = {};
+    swprintf_s(xmlFile, L"%swxn_%lu_%llu.xml", tmpDir, GetCurrentProcessId(),
+               (unsigned long long)GetTickCount64());
+
+    {
+        std::string u8 = wtou8(xml);
+        std::ofstream f(fs::path(xmlFile), std::ios::binary);
+        if (f.is_open()) { f.write(u8.data(), (std::streamsize)u8.size()); f.close(); }
+        else return;   // 连临时文件都写不出来，就别折腾了
+    }
+
+    std::wstring pathArg(xmlFile);
+    for (size_t i = pathArg.find(L'\''); i != std::wstring::npos; i = pathArg.find(L'\'', i + 1))
+        pathArg.insert(i, L"'");   // PowerShell 单引号里自身要写两遍
 
     std::wstring ps =
+        L"[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom,ContentType=WindowsRuntime]|Out-Null;"
         L"[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]|Out-Null;"
-        L"$x=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
-        L"$n=$x.GetElementsByTagName('text');"
-        L"$n.Item(0).AppendChild($x.CreateTextNode('" + wt + L"'))|Out-Null;"
-        L"$n.Item(1).AppendChild($x.CreateTextNode('" + wb + L"'))|Out-Null;"
+        L"[Windows.UI.Notifications.ToastNotification,Windows.UI.Notifications,ContentType=WindowsRuntime]|Out-Null;"
+        L"$x=New-Object Windows.Data.Xml.Dom.XmlDocument;"
+        L"$x.LoadXml([IO.File]::ReadAllText('" + pathArg + L"',[Text.Encoding]::UTF8));"
         L"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('" + std::wstring(AUMID) +
         L"').Show([Windows.UI.Notifications.ToastNotification]::new($x))";
 
@@ -472,11 +842,11 @@ static void send_toast_now(const std::string& t, const std::string& b) {
     PROCESS_INFORMATION pi = {};
     std::wstring cmd = L"powershell -NoP -Command \"" + ps + L"\"";
     if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        // 6 秒上限：卡住的 PowerShell 不该拖死队列
         WaitForSingleObject(pi.hProcess, 6000);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     }
+    DeleteFileW(xmlFile);
 }
 
 static void toast_worker_loop() {
@@ -489,7 +859,7 @@ static void toast_worker_loop() {
             item = std::move(g_toastQueue.front());
             g_toastQueue.pop_front();
         }
-        send_toast_now(item.title, item.body);
+        send_toast_now(item.title, item.body, item.image);
     }
 }
 
@@ -721,15 +1091,20 @@ void handle_push(const json& d) {
 
     if (body.empty()) return;
 
+    // 图片消息：先找微信自己缓存的明文缩略图，没有就让 hook 解一次 dat。
+    // 全程只读文件 + 调 hook 的 HTTP 接口，不注入、不读内存、不重启微信。
+    std::wstring img;
+    if (type == 3 && g_imgPreview.load()) img = resolve_image(d, msgid);
+
     // 只输出到控制台，不写文件
     SYSTEMTIME st;
     GetLocalTime(&st);
-    printf("[%02d:%02d:%02d] [%s] %s\n", st.wHour, st.wMinute, st.wSecond,
-           title.c_str(), body.c_str());
+    printf("[%02d:%02d:%02d] [%s] %s%s\n", st.wHour, st.wMinute, st.wSecond,
+           title.c_str(), body.c_str(), img.empty() ? "" : "  [图片已附]");
     fflush(stdout);
 
     // 入队，立刻返回 —— 不阻塞 httplib 工作线程
-    enqueue_toast(title, body);
+    enqueue_toast(title, body, img);
 }
 
 // ==================== 启动推送服务 ====================
@@ -915,6 +1290,15 @@ int main(int argc, char** argv) {
     GetModuleFileNameW(NULL, b, MAX_PATH);
     g_exeDir = wtou8(std::wstring(b).substr(0, std::wstring(b).find_last_of(L"\\/") + 1));
 
+    // 通知里的图片必须活到 Toast 真正读它为止，统一放自己管的目录
+    {
+        wchar_t la[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, la)))
+            g_imgDir = std::wstring(la) + L"\\WxNotifier\\images";
+        else
+            g_imgDir = u8tow(g_exeDir) + L"images";
+    }
+
     try {
         g_cfg = load_config();
     } catch (const std::exception& e) {
@@ -947,6 +1331,8 @@ int main(int argc, char** argv) {
         if (wm < 0 || wm > 2) wm = (int)WatchMode::CONFIG;
         g_watchMode = wm;
     }
+
+    g_imgPreview = g_cfg.value("image_preview", true);
 
     // 通知类型
     if (g_cfg.contains("notify_types") && g_cfg["notify_types"].is_array()) {
@@ -1000,9 +1386,23 @@ int main(int argc, char** argv) {
     }
     printf("  %s: %s\n", _("hook_api").c_str(), hookApi.c_str());
     printf("  %s: %d\n", _("listen").c_str(), g_listenPort);
-    printf("  %s: %s | %s: %s\n",
-           _("autostart").c_str(), g_autostart.load() ? "ON" : "OFF",
+    printf("  %s: %s\n",
+           _("autostart").c_str(), g_autostart.load() ? "ON" : "OFF");
+    printf("  %s: %s\n",
            _("silent_mode").c_str(), g_silent.load() ? "ON" : "OFF");
+
+    // 图片通知需要知道微信把文件存哪了：自动探测一次，失败就只发文字
+    if (g_imgPreview) detect_wx_roots();
+    printf("  %s: %s (%d)\n", _("image_preview").c_str(),
+           g_imgPreview.load() ? _("img_on").c_str() : _("img_off").c_str(),
+           (int)g_wxRoots.size());
+    if (g_imgPreview && g_wxRoots.empty())
+        printf("  [!] 未探测到微信数据目录，图片通知会退化成文字；可在 config.json 填 wx_data_root\n");
+    // 只打母目录，不把账号目录（含自己的 wxid）写进日志
+    for (auto& r : g_wxRoots) {
+        fs::path p(r);
+        printf("      %s\n", wtou8(p.parent_path().wstring()).c_str());
+    }
     printf("===========================================\n\n");
     fflush(stdout);
 
